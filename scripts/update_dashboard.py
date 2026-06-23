@@ -1,3 +1,4 @@
+```python
 import json
 import math
 import re
@@ -67,32 +68,64 @@ def read_excel_like(path: Path) -> pd.DataFrame:
     raise RuntimeError(f"Could not find usable inventory table in {path.name}")
 
 
-def read_stock(path: Path) -> dict:
+def read_stock(path: Path):
+    """
+    Returns:
+      stock: dict Generic Code -> Available Qty
+      names: dict Generic Code -> Generic Description
+    """
     df = read_excel_like(path)
     columns = list(df.columns)
     normalized = [norm(c) for c in columns]
 
     generic_col = None
     qty_col = None
+    desc_col = None
 
     for col, n in zip(columns, normalized):
-        if generic_col is None and "generic" in n:
+        if generic_col is None and "generic" in n and "description" not in n:
             generic_col = col
-        if qty_col is None and ("available qty" in n or "available quantity" in n or n == "qty" or n.endswith(" qty")):
+
+        if qty_col is None and (
+            "available qty" in n
+            or "available quantity" in n
+            or n == "qty"
+            or n.endswith(" qty")
+        ):
             qty_col = col
+
+        if desc_col is None and (
+            "generic description" in n
+            or "material desc" in n
+            or n == "description"
+            or n.endswith(" description")
+        ):
+            desc_col = col
 
     if generic_col is None or qty_col is None:
         raise RuntimeError(f"Required columns not found in {path.name}. Columns: {columns}")
 
     stock = {}
+    names = {}
+
     for _, row in df.iterrows():
         code = clean_code(row.get(generic_col))
         qty = pd.to_numeric(row.get(qty_col), errors="coerce")
-        if not code or pd.isna(qty) or float(qty) <= 0:
+
+        if not code:
             continue
+
+        if desc_col is not None:
+            desc = str(row.get(desc_col) or "").strip()
+            if desc and desc.lower() != "nan":
+                names.setdefault(code, desc)
+
+        if pd.isna(qty) or float(qty) <= 0:
+            continue
+
         stock[code] = stock.get(code, 0.0) + float(qty)
 
-    return stock
+    return stock, names
 
 
 def parse_data_js(text: str) -> dict:
@@ -146,9 +179,64 @@ def percentile(values, p):
     return values[lo] + (values[hi] - values[lo]) * (idx - lo)
 
 
-def update_db(db, e200, e100, latest_text):
+def add_inventory_only_items(db, e200, e100, e200_names, e100_names):
+    """
+    Adds inventory items that exist in E200/E100 but do not exist in the dashboard index.
+    These items have stock but no department demand history.
+    """
+    existing_codes = set(str(item.get("generic", "")).strip() for item in db.get("items", []))
+    all_stock_codes = set(e200.keys()) | set(e100.keys())
+
+    added = 0
+
+    for code in sorted(all_stock_codes):
+        if not code or code in existing_codes:
+            continue
+
+        lc = float(e200.get(code, 0.0) or 0.0)
+        mosool = float(e100.get(code, 0.0) or 0.0)
+        total = lc + mosool
+
+        if total <= 0:
+            continue
+
+        name = (
+            e200_names.get(code)
+            or e100_names.get(code)
+            or "Inventory item"
+        )
+
+        item = {
+            "generic": code,
+            "name": str(name).strip(),
+            "total_requested": 0,
+            "dept_count": 0,
+            "recommended_weekly_need": 0,
+            "peak_weekly_sum": 0,
+            "lc_qty": int(round(lc)),
+            "mosool_qty": int(round(mosool)),
+            "total_qty": int(round(total)),
+            "coverage_weeks": 0,
+            "coverage_days": 0,
+            "gap_qty_total": 0,
+            "source": source(lc, mosool),
+            "status": "Covered",
+            "priority_score": 0,
+            "priority_label": "Stable",
+            "patterns": "Inventory only / No department demand"
+        }
+
+        db["items"].append(item)
+        existing_codes.add(code)
+        added += 1
+
+    db["overall"]["inventory_only_added"] = added
+
+
+def update_db(db, e200, e100, e200_names, e100_names, latest_text):
     q90 = percentile([x.get("recommended_weekly_need", 0) for x in db["items"]], 0.90) or 1
 
+    # Update department-level items using latest E200/E100 stock.
     for row in db["deptItems"]:
         code = str(row.get("generic", ""))
         lc = e200.get(code, 0.0)
@@ -164,6 +252,7 @@ def update_db(db, e200, e100, latest_text):
         row["source"] = source(lc, mosool)
         row["status"] = status(total, need)
 
+    # Update existing index items using latest E200/E100 stock.
     for item in db["items"]:
         code = str(item.get("generic", ""))
         lc = e200.get(code, 0.0)
@@ -187,6 +276,13 @@ def update_db(db, e200, e100, latest_text):
         item["priority_score"] = score
         item["priority_label"] = priority_label(score)
 
+    # Add new inventory-only items that are not in the original index.
+    add_inventory_only_items(db, e200, e100, e200_names, e100_names)
+
+    # Sort items after adding new inventory-only items.
+    db["items"].sort(key=lambda x: str(x.get("generic", "")))
+
+    # Recalculate department summary.
     for dep in db["deptSummary"]:
         rows = [r for r in db["deptItems"] if r.get("department") == dep.get("department")]
         total = len(rows)
@@ -209,20 +305,23 @@ def update_db(db, e200, e100, latest_text):
     below = sum(1 for x in db["items"] if x.get("status") == "Below Recommended Need")
     na = sum(1 for x in db["items"] if x.get("status") == "Not Available")
 
+    db["overall"]["requested_items"] = requested
     db["overall"]["covered"] = covered
     db["overall"]["below"] = below
     db["overall"]["not_available"] = na
     db["overall"]["critical"] = below + na
     db["overall"]["readiness"] = round2((covered / requested) * 100) if requested else 0
-    db["overall"]["lc_stock"] = int(round(sum(e200.values())))
-    db["overall"]["mosool_stock"] = int(round(sum(e100.values())))
-    db["overall"]["total_stock"] = int(round(sum(e200.values()) + sum(e100.values())))
+
+    db["overall"]["lc_stock"] = int(round(sum(float(x.get("lc_qty", 0) or 0) for x in db["items"])))
+    db["overall"]["mosool_stock"] = int(round(sum(float(x.get("mosool_qty", 0) or 0) for x in db["items"])))
+    db["overall"]["total_stock"] = int(round(sum(float(x.get("total_qty", 0) or 0) for x in db["items"])))
+
     db["overall"]["last_inventory_update"] = latest_text
 
 
 def main():
-    e200 = read_stock(E200_FILE)
-    e100 = read_stock(E100_FILE)
+    e200, e200_names = read_stock(E200_FILE)
+    e100, e100_names = read_stock(E100_FILE)
 
     latest_text = "Latest email update"
     if INFO_FILE.exists():
@@ -233,11 +332,31 @@ def main():
             pass
 
     db = parse_data_js(DATA_FILE.read_text(encoding="utf-8"))
-    update_db(db, e200, e100, latest_text)
-    DATA_FILE.write_text("window.DASHBOARD_DB = " + json.dumps(db, ensure_ascii=False, separators=(",", ":")) + ";\n", encoding="utf-8")
 
-    print(f"Updated dashboard-data.js. E200 codes={len(e200)}, E100 codes={len(e100)}")
+    before_items = len(db.get("items", []))
+
+    update_db(db, e200, e100, e200_names, e100_names, latest_text)
+
+    after_items = len(db.get("items", []))
+    added_items = after_items - before_items
+
+    DATA_FILE.write_text(
+        "window.DASHBOARD_DB = "
+        + json.dumps(db, ensure_ascii=False, separators=(",", ":"))
+        + ";\n",
+        encoding="utf-8"
+    )
+
+    print(
+        f"Updated dashboard-data.js. "
+        f"E200 codes={len(e200)}, "
+        f"E100 codes={len(e100)}, "
+        f"items before={before_items}, "
+        f"items after={after_items}, "
+        f"inventory-only added={added_items}"
+    )
 
 
 if __name__ == "__main__":
     main()
+```
