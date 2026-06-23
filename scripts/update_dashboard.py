@@ -1,4 +1,3 @@
-```python
 import json
 import math
 import re
@@ -359,4 +358,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
+
